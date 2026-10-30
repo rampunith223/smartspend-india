@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { requireAuth } from '../auth.js';
-import { db, mapBudget, mapTransaction } from '../db.js';
+import Transaction from '../models/Transaction.js';
+import Budget from '../models/Budget.js';
 import { EXPENSE_CATEGORIES, PAYMENT_METHODS, getCategory } from '../../shared/catalog.js';
 import { ApiError, asyncHandler } from '../lib/http.js';
 import { monthBounds, monthLabel, previousMonth, toDateKey, toMonthKey } from '../lib/date.js';
@@ -30,33 +31,46 @@ router.get(
     }
 
     const info = monthBounds(month);
-    const transactions = db
-      .prepare(
-        `SELECT * FROM transactions
-         WHERE user_id = ? AND date >= ? AND date <= ?
-         ORDER BY date ASC, created_at ASC`,
-      )
-      .all(req.user.id, info.start, info.end)
-      .map(mapTransaction);
+    const transactions = await Transaction.find({
+      user_id: req.user.id,
+      date: { $gte: info.start, $lte: info.end },
+    }).sort({ date: 1, created_at: 1 });
 
-    const summary = summarizeTransactions(transactions);
-    const categories = categoryBreakdown(transactions, EXPENSE_CATEGORIES);
-    const budgets = db
-      .prepare('SELECT * FROM budgets WHERE user_id = ? AND month = ? ORDER BY category')
-      .all(req.user.id, month)
-      .map(mapBudget);
+    const mappedTransactions = transactions.map((t) => ({
+      id: t._id,
+      type: t.type,
+      amountPaise: t.amount_paise,
+      category: t.category,
+      date: t.date,
+      paymentMethod: t.payment_method,
+      note: t.note,
+      createdAt: t.created_at,
+      updatedAt: t.updated_at,
+    }));
 
-    const previousTransactions = db
-      .prepare(
-        `SELECT * FROM transactions
-         WHERE user_id = ? AND date >= ? AND date <= ?`,
-      )
-      .all(
-        req.user.id,
-        `${previousMonth(month)}-01`,
-        `${previousMonth(month)}-${String(monthBounds(previousMonth(month)).days).padStart(2, '0')}`,
-      )
-      .map(mapTransaction);
+    const summary = summarizeTransactions(mappedTransactions);
+    const categories = categoryBreakdown(mappedTransactions, EXPENSE_CATEGORIES);
+    const budgets = await Budget.find({
+      user_id: req.user.id,
+      month,
+    }).sort({ category: 1 });
+
+    const prevMonth = previousMonth(month);
+    const prevInfo = monthBounds(prevMonth);
+    const previousTransactions = await Transaction.find({
+      user_id: req.user.id,
+      date: { $gte: prevInfo.start, $lte: prevInfo.end },
+    }).map((t) => ({
+      id: t._id,
+      type: t.type,
+      amountPaise: t.amount_paise,
+      category: t.category,
+      date: t.date,
+      paymentMethod: t.payment_method,
+      note: t.note,
+      createdAt: t.created_at,
+      updatedAt: t.updated_at,
+    }));
     const previousSummary = summarizeTransactions(previousTransactions);
 
     const rows = [
@@ -91,16 +105,16 @@ router.get(
               0;
         return [
           budget.category === 'overall' ? 'Everything' : getCategory(budget.category)?.label,
-          (budget.limitPaise / 100).toFixed(2),
+          (budget.limit_paise / 100).toFixed(2),
           (spent / 100).toFixed(2),
-          ((budget.limitPaise - spent) / 100).toFixed(2),
-          budget.limitPaise > 0 ? Math.round((spent / budget.limitPaise) * 100) : 0,
+          ((budget.limit_paise - spent) / 100).toFixed(2),
+          budget.limit_paise > 0 ? Math.round((spent / budget.limit_paise) * 100) : 0,
         ];
       }),
       [],
       ['Transactions'],
       ['Date', 'Type', 'Category', 'Payment method', 'Note', 'Amount (INR)'],
-      ...transactions.map((transaction) => [
+      ...mappedTransactions.map((transaction) => [
         transaction.date,
         transaction.type,
         getCategory(transaction.category)?.label || transaction.category,

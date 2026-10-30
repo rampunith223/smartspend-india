@@ -1,6 +1,10 @@
 import { Router } from 'express';
 import { requireAuth } from '../auth.js';
-import { db, mapBudget, mapGoal, mapTransaction } from '../db.js';
+import Transaction from '../models/Transaction.js';
+import Budget from '../models/Budget.js';
+import Recurring from '../models/Recurring.js';
+import Goal from '../models/Goal.js';
+import Contribution from '../models/Contribution.js';
 import { EXPENSE_CATEGORIES, PAYMENT_METHODS, getCategory } from '../../shared/catalog.js';
 import { ApiError, asyncHandler } from '../lib/http.js';
 import {
@@ -25,16 +29,58 @@ import {
 const router = Router();
 router.use(requireAuth);
 
-function monthRows(userId, month) {
+function mapTransaction(doc) {
+  if (!doc) return null;
+  const o = doc.toObject();
+  return {
+    id: o._id,
+    type: o.type,
+    amountPaise: o.amount_paise,
+    category: o.category,
+    date: o.date,
+    paymentMethod: o.payment_method,
+    note: o.note,
+    createdAt: o.created_at,
+    updatedAt: o.updated_at,
+  };
+}
+
+function mapBudget(doc) {
+  if (!doc) return null;
+  const o = doc.toObject();
+  return {
+    id: o._id,
+    month: o.month,
+    category: o.category,
+    limitPaise: o.limit_paise,
+    createdAt: o.created_at,
+    updatedAt: o.updated_at,
+  };
+}
+
+function mapGoal(doc) {
+  if (!doc) return null;
+  const o = doc.toObject();
+  return {
+    id: o._id,
+    title: o.title,
+    targetPaise: o.target_paise,
+    savedPaise: o.saved_paise,
+    monthlyTargetPaise: o.monthly_target_paise || 0,
+    targetDate: o.target_date,
+    color: o.color,
+    createdAt: o.created_at,
+    updatedAt: o.updated_at,
+  };
+}
+
+async function monthRows(userId, month) {
   const info = monthBounds(month);
-  return db
-    .prepare(
-      `SELECT * FROM transactions
-       WHERE user_id = ? AND date >= ? AND date <= ?
-       ORDER BY date DESC, created_at DESC`,
-    )
-    .all(userId, info.start, info.end)
-    .map(mapTransaction);
+  const docs = await Transaction.find({
+    user_id: userId,
+    date: { $gte: info.start, $lte: info.end },
+  }).sort({ date: -1, created_at: -1 });
+  return docs.map(mapTransaction);
 }
 
 router.get(
@@ -49,28 +95,36 @@ router.get(
     const info = monthBounds(month, today);
     const previous = previousMonth(month);
 
-    const currentTransactions = monthRows(req.user.id, month);
-    const previousTransactions = monthRows(req.user.id, previous);
+    const currentTransactions = await monthRows(req.user.id, month);
+    const previousTransactions = await monthRows(req.user.id, previous);
 
     const summary = summarizeTransactions(currentTransactions);
     const previousSummary = summarizeTransactions(previousTransactions);
 
     const weekStart = addDays(today, -6);
-    const weekExpensePaise = db
-      .prepare(
-        `SELECT COALESCE(SUM(amount_paise), 0) AS total
-         FROM transactions
-         WHERE user_id = ? AND type = 'expense' AND date >= ? AND date <= ?`,
-      )
-      .get(req.user.id, weekStart, today).total;
+    const weekExpenseAgg = await Transaction.aggregate([
+      {
+        $match: {
+          user_id: req.user.id,
+          type: 'expense',
+          date: { $gte: weekStart, $lte: today },
+        },
+      },
+      { $group: { _id: null, total: { $sum: '$amount_paise' } } },
+    ]);
+    const weekExpensePaise = weekExpenseAgg.length > 0 ? weekExpenseAgg[0].total : 0;
 
-    const todayExpensePaise = db
-      .prepare(
-        `SELECT COALESCE(SUM(amount_paise), 0) AS total
-         FROM transactions
-         WHERE user_id = ? AND type = 'expense' AND date = ?`,
-      )
-      .get(req.user.id, today).total;
+    const todayExpenseAgg = await Transaction.aggregate([
+      {
+        $match: {
+          user_id: req.user.id,
+          type: 'expense',
+          date: today,
+        },
+      },
+      { $group: { _id: null, total: { $sum: '$amount_paise' } } },
+    ]);
+    const todayExpensePaise = todayExpenseAgg.length > 0 ? todayExpenseAgg[0].total : 0;
 
     const expenseChangePct =
       previousSummary.expensePaise > 0
@@ -81,16 +135,17 @@ router.get(
           )
         : null;
 
-    const budgetRows = db
-      .prepare('SELECT * FROM budgets WHERE user_id = ? AND month = ? ORDER BY category')
-      .all(req.user.id, month)
-      .map(mapBudget);
+    const budgetRows = await Budget.find({
+      user_id: req.user.id,
+      month,
+    }).sort({ category: 1 });
+    const budgets = budgetRows.map(mapBudget);
 
     const categories = categoryBreakdown(currentTransactions, EXPENSE_CATEGORIES);
     const previousCategories = categoryBreakdown(previousTransactions, EXPENSE_CATEGORIES);
     const payments = paymentBreakdown(currentTransactions, PAYMENT_METHODS);
 
-    const budgetCards = budgetRows.map((budget) => {
+    const budgetCards = budgets.map((budget) => {
       const spentPaise =
         budget.category === 'overall'
           ? summary.expensePaise
@@ -105,20 +160,17 @@ router.get(
       };
     });
 
-    const recurringRows = db
-      .prepare(
-        `SELECT * FROM recurring_expenses
-         WHERE user_id = ? AND is_active = 1
-         ORDER BY next_due_date ASC`,
-      )
-      .all(req.user.id);
+    const recurringRows = await Recurring.find({
+      user_id: req.user.id,
+      is_active: true,
+    }).sort({ next_due_date: 1 });
 
     const upcomingBills = recurringRows
       .filter((bill) => bill.next_due_date <= addDays(today, 45))
       .map((bill) => {
         const meta = getCategory(bill.category);
         return {
-          id: bill.id,
+          id: bill._id,
           title: bill.title,
           amountPaise: bill.amount_paise,
           category: bill.category,
@@ -137,14 +189,14 @@ router.get(
           bill.next_due_date <= `${month}-${String(info.days).padStart(2, '0')}`,
       )
       .map((bill) => ({
-        id: bill.id,
+        id: bill._id,
         title: bill.title,
         amountPaise: bill.amount_paise,
         nextDueDate: bill.next_due_date,
         category: bill.category,
       }));
 
-    const overallBudget = budgetRows.find((budget) => budget.category === 'overall');
+    const overallBudget = budgets.find((budget) => budget.category === 'overall');
     const safeToSpend = computeSafeToSpend({
       budgetPaise: overallBudget?.limitPaise || req.user.monthlyIncomePaise || 0,
       spentPaise: summary.expensePaise,
@@ -173,63 +225,76 @@ router.get(
     const trendMonths = lastNMonths(month, 6);
     const trendStart = `${trendMonths[0]}-01`;
     const trendEnd = `${month}-${String(info.days).padStart(2, '0')}`;
-    const trendRows = db
-      .prepare(
-        `SELECT substr(date, 1, 7) AS month,
-                SUM(CASE WHEN type = 'income' THEN amount_paise ELSE 0 END) AS income,
-                SUM(CASE WHEN type = 'expense' THEN amount_paise ELSE 0 END) AS expense
-         FROM transactions
-         WHERE user_id = ? AND date >= ? AND date <= ?
-         GROUP BY substr(date, 1, 7)`,
-      )
-      .all(req.user.id, trendStart, trendEnd);
-    const trendMap = new Map(trendRows.map((row) => [row.month, row]));
+    const trendRows = await Transaction.aggregate([
+      {
+        $match: {
+          user_id: req.user.id,
+          date: { $gte: trendStart, $lte: trendEnd },
+        },
+      },
+      {
+        $group: {
+          _id: { $substr: ['$date', 0, 7] },
+          income: {
+            $sum: { $cond: [{ $eq: ['$type', 'income'] }, '$amount_paise', 0] },
+          },
+          expense: {
+            $sum: { $cond: [{ $eq: ['$type', 'expense'] }, '$amount_paise', 0] },
+          },
+        },
+      },
+    ]);
+    const trendMap = new Map(trendRows.map((row) => [row._id, row]));
     const monthlyTrend = trendMonths.map((trendMonth) => ({
       month: trendMonth,
       incomePaise: trendMap.get(trendMonth)?.income || 0,
       expensePaise: trendMap.get(trendMonth)?.expense || 0,
     }));
 
-    const recentRows = db
-      .prepare(
-        `SELECT * FROM transactions
-         WHERE user_id = ?
-         ORDER BY date DESC, created_at DESC
-         LIMIT 6`,
-      )
-      .all(req.user.id)
-      .map(mapTransaction);
+    const recentRows = await Transaction.find({ user_id: req.user.id })
+      .sort({ date: -1, created_at: -1 })
+      .limit(6)
+      .then((docs) => docs.map(mapTransaction));
 
-    const goalRows = db
-      .prepare('SELECT * FROM savings_goals WHERE user_id = ? ORDER BY created_at ASC')
-      .all(req.user.id)
-      .map(mapGoal)
-      .map((goal) => {
-        const savedThisMonthPaise = goal.monthlyTargetPaise
-          ? db
-              .prepare(
-                `SELECT COALESCE(SUM(amount_paise), 0) AS total
-                 FROM savings_contributions
-                 WHERE goal_id = ? AND user_id = ? AND substr(date, 1, 7) = ?`,
-              )
-              .get(goal.id, req.user.id, toMonthKey()).total
-          : 0;
+    const goalRows = await Goal.find({ user_id: req.user.id }).sort({ created_at: 1 });
+    const currentMonthKey = toMonthKey();
+
+    const goalRowsWithProgress = await Promise.all(
+      goalRows.map(async (goal) => {
+        let savedThisMonthPaise = 0;
+        if (goal.monthly_target_paise > 0) {
+          const agg = await Contribution.aggregate([
+            {
+              $match: {
+                goal_id: goal._id,
+                user_id: req.user.id,
+                date: { $regex: `^${currentMonthKey}` },
+              },
+            },
+            { $group: { _id: null, total: { $sum: '$amount_paise' } } },
+          ]);
+          savedThisMonthPaise = agg.length > 0 ? agg[0].total : 0;
+        }
+        const g = mapGoal(goal);
         return {
-          ...goal,
-          progress: goal.targetPaise > 0 ? Math.round((goal.savedPaise / goal.targetPaise) * 100) : 0,
+          ...g,
+          progress: g.targetPaise > 0 ? Math.round((g.savedPaise / g.targetPaise) * 100) : 0,
           savedThisMonthPaise,
-          monthlyRemainingPaise: Math.max(0, goal.monthlyTargetPaise - savedThisMonthPaise),
+          monthlyRemainingPaise: Math.max(0, g.monthlyTargetPaise - savedThisMonthPaise),
           monthlyComplete:
-            goal.monthlyTargetPaise > 0 && savedThisMonthPaise >= goal.monthlyTargetPaise,
+            g.monthlyTargetPaise > 0 && savedThisMonthPaise >= g.monthlyTargetPaise,
         };
-      });
+      })
+    );
 
     // Monthly savings reminder: fires when the budget plan is crossed (or about to be)
     // and a goal with a monthly target still has saving left to do this month.
-    const currentMonthKey = toMonthKey();
     let goalReminder = null;
-    if (month === currentMonthKey && (safeToSpend.status === 'over' || safeToSpend.status === 'warning')) {
-      const reminderGoals = goalRows
+    if (
+      month === currentMonthKey &&
+      (safeToSpend.status === 'over' || safeToSpend.status === 'warning')
+    ) {
+      const reminderGoals = goalRowsWithProgress
         .filter(
           (goal) =>
             goal.monthlyTargetPaise > 0 &&
@@ -276,7 +341,7 @@ router.get(
       recentTransactions: recentRows,
       upcomingBills,
       insights,
-      goals: goalRows,
+      goals: goalRowsWithProgress,
       goalReminder,
     });
   }),

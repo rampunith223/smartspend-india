@@ -46,6 +46,7 @@ import {
 import { useAuth } from '../context/AuthContext.jsx';
 import { useQuickAdd } from '../context/QuickAddContext.jsx';
 import { api, fetcher } from '../lib/api.js';
+import Modal from '../components/ui/Modal.jsx';
 import { cn } from '../lib/cn.js';
 import { currentMonth, formatDate, formatMonth, greeting, relativeDay, toDateKey } from '../lib/dates.js';
 import { formatINR, formatPercent } from '../lib/format.js';
@@ -824,6 +825,92 @@ function GoalsStrip({ goals }) {
   );
 }
 
+function BudgetOverPopup({ data, onClose }) {
+  const safe = data.safeToSpend;
+  const overduePaise = Math.max(0, safe.spentPaise - safe.budgetPaise);
+  const [dismissed, setDismissed] = useState(() => {
+    try {
+      return window.localStorage.getItem(`smarts:budget-over-dismissed:${data.month}`) === '1';
+    } catch {
+      return false;
+    }
+  });
+
+  if (dismissed || safe.status !== 'over') return null;
+
+  function handleDismiss() {
+    try {
+      window.localStorage.setItem(`smarts:budget-over-dismissed:${data.month}`, '1');
+    } catch {
+      /* storage is best-effort */
+    }
+    setDismissed(true);
+    onClose();
+  }
+
+  return (
+    <Modal
+      open={true}
+      onClose={handleDismiss}
+      dismissible
+      title="Budget Overused"
+      description="You've spent more than your monthly budget plan."
+      footer={
+        <div className="flex gap-2">
+          <Button variant="secondary" className="flex-1" onClick={handleDismiss}>
+            Dismiss
+          </Button>
+          <Link to="/app/budgets">
+            <Button className="flex-1">View Budget</Button>
+          </Link>
+        </div>
+      }
+    >
+      <div className="space-y-3">
+        <div className="flex items-start gap-3">
+          <span
+            className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-clay-50 text-clay-600 dark:bg-clay-500/15 dark:text-clay-300"
+          >
+            <AlertCircle size={18} />
+          </span>
+          <div className="min-w-0 flex-1">
+            <p className="text-[10px] font-bold uppercase tracking-[0.16em] text-clay-600 dark:text-clay-300">
+              Budget Alert
+            </p>
+            <h2 className="font-display text-lg font-semibold tracking-[-0.02em] text-ink-950 dark:text-white">
+              You're over budget
+            </h2>
+            <p className="mt-1 text-xs leading-relaxed text-ink-500 dark:text-ink-400">
+              You've spent{' '}
+              <strong className="text-ink-900 dark:text-white">{formatINR(safe.spentPaise)}</strong>{' '}
+              against a{' '}
+              <strong className="text-ink-900 dark:text-white">{formatINR(safe.budgetPaise)}</strong>{' '}
+              monthly budget.
+            </p>
+          </div>
+        </div>
+        <div className="rounded-2xl border border-clay-200 bg-clay-50 px-4 py-4 dark:border-clay-500/20 dark:bg-clay-500/10">
+          <div className="flex items-center justify-between text-[11px]">
+            <span className="font-bold text-ink-600 dark:text-ink-300">Amount over budget</span>
+            <span className="font-bold text-clay-700 dark:text-clay-300">
+              {formatINR(overduePaise)}
+            </span>
+          </div>
+          <div className="flex items-center justify-between text-[11px] mt-2">
+            <span className="font-bold text-ink-600 dark:text-ink-300">You need to save</span>
+            <span className="font-bold text-clay-700 dark:text-clay-300">
+              {formatINR(overduePaise)}
+            </span>
+          </div>
+          <p className="mt-3 text-[11px] text-ink-500 dark:text-ink-400">
+            Cut back on non-essential spends or add income to get back on track this month.
+          </p>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
 function DashboardSkeleton() {
   return (
     <div className="space-y-5">
@@ -914,6 +1001,8 @@ export default function DashboardPage() {
               }}
             />
           ) : null}
+
+          <BudgetOverPopup data={data} onClose={() => {}} />
 
           <div className="grid gap-5 lg:grid-cols-12">
             <div className="lg:col-span-7">

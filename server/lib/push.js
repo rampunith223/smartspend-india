@@ -1,6 +1,12 @@
 import crypto from 'node:crypto';
 import webpush from 'web-push';
-import { db, nowIso } from '../db.js';
+import PushSubscription from '../models/PushSubscription.js';
+import NotificationLog from '../models/NotificationLog.js';
+import Transaction from '../models/Transaction.js';
+import Budget from '../models/Budget.js';
+import Recurring from '../models/Recurring.js';
+import User from '../models/User.js';
+import Goal from '../models/Goal.js';
 import { computeSafeToSpend } from './calc.js';
 import { monthBounds, toDateKey, toMonthKey } from './date.js';
 import { formatINR } from './money.js';
@@ -19,58 +25,45 @@ export function getVapidPublicKey() {
   return publicKey || null;
 }
 
-function mapSubscription(row) {
-  if (!row) return null;
-  return {
-    endpoint: row.endpoint,
-    keys: { p256dh: row.p256dh, auth: row.auth },
-  };
-}
-
-export function saveSubscription(userId, subscription, userAgent = '') {
+export async function saveSubscription(userId, subscription, userAgent = '') {
   if (!subscription?.endpoint || !subscription?.keys?.p256dh || !subscription?.keys?.auth) {
     throw new Error('Invalid push subscription.');
   }
-  db.prepare(
-    `INSERT INTO push_subscriptions (id, user_id, endpoint, p256dh, auth, user_agent, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)
-     ON CONFLICT(endpoint) DO UPDATE SET p256dh = excluded.p256dh, auth = excluded.auth`,
-  ).run(
-    crypto.randomUUID(),
-    userId,
-    subscription.endpoint,
-    subscription.keys.p256dh,
-    subscription.keys.auth,
-    userAgent.slice(0, 200),
-    nowIso(),
+  await PushSubscription.findOneAndUpdate(
+    { endpoint: subscription.endpoint },
+    {
+      user_id: userId,
+      p256dh: subscription.keys.p256dh,
+      auth: subscription.keys.auth,
+      user_agent: userAgent.slice(0, 200),
+    },
+    { upsert: true, new: true },
   );
 }
 
-export function removeSubscription(userId, endpoint) {
-  const result = db
-    .prepare('DELETE FROM push_subscriptions WHERE user_id = ? AND endpoint = ?')
-    .run(userId, endpoint);
-  return result.changes > 0;
+export async function removeSubscription(userId, endpoint) {
+  const result = await PushSubscription.deleteOne({ user_id: userId, endpoint });
+  return result.deletedCount > 0;
 }
 
-export function listSubscriptions(userId) {
-  return db
-    .prepare('SELECT * FROM push_subscriptions WHERE user_id = ?')
-    .all(userId)
-    .map(mapSubscription);
+export async function listSubscriptions(userId) {
+  const rows = await PushSubscription.find({ user_id: userId });
+  return rows.map((row) => ({
+    endpoint: row.endpoint,
+    keys: { p256dh: row.p256dh, auth: row.auth },
+  }));
 }
 
 async function sendToSubscription(subscription, payload) {
   try {
     await webpush.sendNotification(subscription, JSON.stringify(payload), {
-      TTL: 60 * 60 * 24, // keep undelivered pushes for a day
+      TTL: 60 * 60 * 24,
       urgency: 'normal',
     });
     return true;
   } catch (error) {
-    // 404/410 = subscription expired or the app was removed.
     if (error.statusCode === 404 || error.statusCode === 410) {
-      db.prepare('DELETE FROM push_subscriptions WHERE endpoint = ?').run(subscription.endpoint);
+      await PushSubscription.deleteOne({ endpoint: subscription.endpoint });
     }
     return false;
   }
@@ -78,7 +71,7 @@ async function sendToSubscription(subscription, payload) {
 
 export async function sendPushToUser(userId, payload) {
   if (!pushConfigured) return 0;
-  const subscriptions = listSubscriptions(userId);
+  const subscriptions = await listSubscriptions(userId);
   let sent = 0;
   for (const subscription of subscriptions) {
     const ok = await sendToSubscription(subscription, payload);
@@ -87,80 +80,91 @@ export async function sendPushToUser(userId, payload) {
   return sent;
 }
 
-function alreadyNotifiedToday(userId, kind, day) {
-  const row = db
-    .prepare('SELECT 1 AS hit FROM notification_log WHERE user_id = ? AND kind = ? AND day = ?')
-    .get(userId, kind, day);
+export async function alreadyNotifiedToday(userId, kind, day) {
+  const row = await NotificationLog.findOne({ user_id: userId, kind, day });
   return Boolean(row);
 }
 
-function logNotification(userId, kind, day) {
-  db.prepare(
-    'INSERT OR IGNORE INTO notification_log (id, user_id, kind, day, created_at) VALUES (?, ?, ?, ?, ?)',
-  ).run(crypto.randomUUID(), userId, kind, day, nowIso());
+export async function logNotification(userId, kind, day) {
+  await NotificationLog.findOneAndUpdate(
+    { user_id: userId, kind, day },
+    { user_id: userId, kind, day },
+    { upsert: true, new: true },
+  );
 }
 
 // Builds the savings alarm payload if the user's budget plan is crossed and a
 // monthly goal still has saving left this month. Returns null when no push is due.
-export function buildGoalReminder(userId) {
+export async function buildGoalReminder(userId) {
   const today = toDateKey();
   const month = toMonthKey();
   const info = monthBounds(month, today);
 
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
+  const user = await User.findById(userId);
   if (!user || !user.notifications) return null;
 
-  const expenseRow = db
-    .prepare(
-      `SELECT COALESCE(SUM(amount_paise), 0) AS total
-       FROM transactions
-       WHERE user_id = ? AND type = 'expense' AND date >= ? AND date <= ?`,
-    )
-    .get(userId, info.start, info.end);
+  const expenseRow = await Transaction.aggregate([
+    {
+      $match: {
+        user_id: userId,
+        type: 'expense',
+        date: { $gte: info.start, $lte: info.end },
+      },
+    },
+    {
+      $group: { _id: null, total: { $sum: '$amount_paise' } },
+    },
+  ]);
+  const spentPaise = expenseRow.length > 0 ? expenseRow[0].total : 0;
 
-  const overallBudget = db
-    .prepare(
-      `SELECT limit_paise FROM budgets
-       WHERE user_id = ? AND month = ? AND category = 'overall'`,
-    )
-    .get(userId, month);
-
+  const overallBudget = await Budget.findOne({
+    user_id: userId,
+    month,
+    category: 'overall',
+  });
   const budgetPaise = overallBudget?.limit_paise || user.monthly_income_paise || 0;
   if (budgetPaise <= 0) return null;
 
-  const reservedBills = db
-    .prepare(
-      `SELECT id, title, amount_paise, next_due_date AS nextDueDate, category
-       FROM recurring_expenses
-       WHERE user_id = ? AND is_active = 1 AND next_due_date >= ? AND next_due_date <= ?`,
-    )
-    .all(userId, today, info.end);
+  const reservedBills = await Recurring.find({
+    user_id: userId,
+    is_active: true,
+    next_due_date: { $gte: today, $lte: info.end },
+  });
 
   const safe = computeSafeToSpend({
     budgetPaise,
-    spentPaise: expenseRow.total,
-    reservedBills,
+    spentPaise,
+    reservedBills: reservedBills.map((b) => ({
+      id: b._id,
+      title: b.title,
+      amountPaise: b.amount_paise,
+      nextDueDate: b.next_due_date,
+      category: b.category,
+    })),
     month,
     today,
   });
   if (safe.status !== 'over' && safe.status !== 'warning') return null;
 
-  const goals = db
-    .prepare(
-      `SELECT * FROM savings_goals
-       WHERE user_id = ? AND monthly_target_paise > 0 AND saved_paise < target_paise`,
-    )
-    .all(userId);
+  const goals = await Goal.find({
+    user_id: userId,
+    monthly_target_paise: { $gt: 0 },
+    saved_paise: { $lt: '$target_paise' },
+  });
 
   const behind = [];
   for (const goal of goals) {
-    const savedThisMonth = db
-      .prepare(
-        `SELECT COALESCE(SUM(amount_paise), 0) AS total
-         FROM savings_contributions
-         WHERE goal_id = ? AND user_id = ? AND substr(date, 1, 7) = ?`,
-      )
-      .get(goal.id, userId, month).total;
+    const savedThisMonthAgg = await Contribution.aggregate([
+      {
+        $match: {
+          goal_id: goal._id,
+          user_id: userId,
+          date: { $regex: `^${month}` },
+        },
+      },
+      { $group: { _id: null, total: { $sum: '$amount_paise' } } },
+    ]);
+    const savedThisMonth = savedThisMonthAgg.length > 0 ? savedThisMonthAgg[0].total : 0;
     const remaining = goal.monthly_target_paise - savedThisMonth;
     if (remaining > 0) {
       behind.push({
@@ -173,7 +177,7 @@ export function buildGoalReminder(userId) {
   if (!behind.length) return null;
   behind.sort((a, b) => b.remainingPaise - a.remainingPaise);
 
-  if (alreadyNotifiedToday(userId, 'goal-reminder', today)) return null;
+  if (await alreadyNotifiedToday(userId, 'goal-reminder', today)) return null;
 
   const top = behind[0];
   const overPaise = Math.max(0, safe.spentPaise - safe.budgetPaise);
@@ -197,22 +201,27 @@ export function buildGoalReminder(userId) {
 
 export async function runReminderSweep() {
   if (!pushConfigured) return 0;
-  const users = db
-    .prepare(
-      `SELECT DISTINCT u.id AS id
-       FROM users u
-       JOIN push_subscriptions p ON p.user_id = u.id
-       WHERE u.notifications = 1`,
-    )
-    .all();
+  const users = await PushSubscription.aggregate([
+    { $group: { _id: '$user_id' } },
+    {
+      $lookup: {
+        from: 'users',
+        localField: '_id',
+        foreignField: '_id',
+        as: 'user',
+      },
+    },
+    { $match: { 'user.notifications': true } },
+    { $project: { id: '$_id' } },
+  ]);
 
   let sent = 0;
   for (const { id } of users) {
-    const reminder = buildGoalReminder(id);
+    const reminder = await buildGoalReminder(id);
     if (!reminder) continue;
     const count = await sendPushToUser(id, reminder.payload);
     if (count > 0) {
-      reminder.log();
+      await reminder.log();
       sent += count;
     }
   }
@@ -228,7 +237,6 @@ export function startReminderScheduler(intervalMs = 15 * 60 * 1000) {
       console.error('Reminder sweep failed:', error.message);
     });
   }, intervalMs);
-  // Do not keep the process alive just for the scheduler.
   timer.unref?.();
 }
 

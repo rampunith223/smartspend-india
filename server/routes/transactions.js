@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import { Router } from 'express';
 import { requireAuth } from '../auth.js';
-import { db, mapTransaction, nowIso } from '../db.js';
+import Transaction from '../models/Transaction.js';
 import { ApiError, asyncHandler, parseBody } from '../lib/http.js';
 import { monthBounds, toDateKey, toMonthKey } from '../lib/date.js';
 import {
@@ -20,6 +20,22 @@ function ensureNotFuture(date) {
   }
 }
 
+function mapTransaction(doc) {
+  if (!doc) return null;
+  const o = doc.toObject();
+  return {
+    id: o._id,
+    type: o.type,
+    amountPaise: o.amount_paise,
+    category: o.category,
+    date: o.date,
+    paymentMethod: o.payment_method,
+    note: o.note,
+    createdAt: o.created_at,
+    updatedAt: o.updated_at,
+  };
+}
+
 router.get(
   '/',
   asyncHandler(async (req, res) => {
@@ -28,71 +44,67 @@ router.get(
       throw new ApiError(400, 'Choose a valid month.');
     }
 
-    const conditions = ['user_id = ?'];
-    const values = [req.user.id];
     const info = monthBounds(month);
+    const filter = {
+      user_id: req.user.id,
+      date: { $gte: info.start, $lte: info.end },
+    };
 
-    conditions.push('date >= ? AND date <= ?');
-    values.push(info.start, info.end);
-
-    if (req.query.from) {
-      conditions.push('date >= ?');
-      values.push(req.query.from);
-    }
-    if (req.query.to) {
-      conditions.push('date <= ?');
-      values.push(req.query.to);
-    }
+    if (req.query.from) filter.date.$gte = req.query.from;
+    if (req.query.to) filter.date.$lte = req.query.to;
     if (req.query.type === 'expense' || req.query.type === 'income') {
-      conditions.push('type = ?');
-      values.push(req.query.type);
+      filter.type = req.query.type;
     }
     if (req.query.category && allCategoryIds.includes(req.query.category)) {
-      conditions.push('category = ?');
-      values.push(req.query.category);
+      filter.category = req.query.category;
     }
     if (req.query.payment && paymentIds.includes(req.query.payment)) {
-      conditions.push('payment_method = ?');
-      values.push(req.query.payment);
+      filter.payment_method = req.query.payment;
     }
     if (req.query.search && String(req.query.search).trim()) {
-      const search = `%${String(req.query.search).trim().slice(0, 80)}%`;
-      conditions.push('(note LIKE ? OR category LIKE ?)');
-      values.push(search, search);
+      const search = new RegExp(String(req.query.search).trim().slice(0, 80), 'i');
+      filter.$or = [{ note: search }, { category: search }];
     }
 
-    const where = conditions.join(' AND ');
     const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 100);
     const offset = Math.max(Number(req.query.offset) || 0, 0);
 
-    const rows = db
-      .prepare(
-        `SELECT * FROM transactions
-         WHERE ${where}
-         ORDER BY date DESC, created_at DESC
-         LIMIT ? OFFSET ?`,
-      )
-      .all(...values, limit, offset);
+    const itemsCursor = Transaction.find(filter)
+      .sort({ date: -1, created_at: -1 })
+      .skip(offset)
+      .limit(limit);
 
-    const totals = db
-      .prepare(
-        `SELECT
-           COALESCE(SUM(CASE WHEN type = 'income' THEN amount_paise ELSE 0 END), 0) AS income,
-           COALESCE(SUM(CASE WHEN type = 'expense' THEN amount_paise ELSE 0 END), 0) AS expense,
-           COUNT(*) AS count
-         FROM transactions WHERE ${where}`,
-      )
-      .get(...values);
+    const totalsCursor = Transaction.aggregate([
+      { $match: filter },
+      {
+        $group: {
+          _id: null,
+          income: {
+            $sum: { $cond: [{ $eq: ['$type', 'income'] }, '$amount_paise', 0] },
+          },
+          expense: {
+            $sum: { $cond: [{ $eq: ['$type', 'expense'] }, '$amount_paise', 0] },
+          },
+          count: { $sum: 1 },
+        },
+      },
+    ]);
+
+    const [items, totals] = await Promise.all([itemsCursor, totalsCursor]);
+
+    const total = totals.length > 0 ? totals[0].count : 0;
+    const incomePaise = totals.length > 0 ? totals[0].income : 0;
+    const expensePaise = totals.length > 0 ? totals[0].expense : 0;
 
     res.json({
-      items: rows.map(mapTransaction),
-      total: totals.count,
+      items: items.map(mapTransaction),
+      total,
       limit,
       offset,
-      hasMore: offset + rows.length < totals.count,
+      hasMore: offset + items.length < total,
       summary: {
-        incomePaise: totals.income,
-        expensePaise: totals.expense,
+        incomePaise,
+        expensePaise,
       },
     });
   }),
@@ -104,27 +116,19 @@ router.post(
     const input = parseBody(transactionSchema, req.body);
     ensureNotFuture(input.date);
 
-    const id = crypto.randomUUID();
-    const timestamp = nowIso();
-    db.prepare(
-      `INSERT INTO transactions
-        (id, user_id, type, amount_paise, category, date, payment_method, note, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(
-      id,
-      req.user.id,
-      input.type,
-      input.amountPaise,
-      input.category,
-      input.date,
-      input.paymentMethod,
-      input.note || '',
-      timestamp,
-      timestamp,
-    );
+    const transaction = await Transaction.create({
+      _id: crypto.randomUUID(),
+      user_id: req.user.id,
+      type: input.type,
+      amount_paise: input.amountPaise,
+      category: input.category,
+      date: input.date,
+      payment_method: input.paymentMethod,
+      note: input.note || '',
+    });
 
     res.status(201).json({
-      transaction: mapTransaction(db.prepare('SELECT * FROM transactions WHERE id = ?').get(id)),
+      transaction: mapTransaction(transaction),
     });
   }),
 );
@@ -132,9 +136,10 @@ router.post(
 router.patch(
   '/:id',
   asyncHandler(async (req, res) => {
-    const existing = db
-      .prepare('SELECT * FROM transactions WHERE id = ? AND user_id = ?')
-      .get(req.params.id, req.user.id);
+    const existing = await Transaction.findOne({
+      _id: req.params.id,
+      user_id: req.user.id,
+    });
     if (!existing) {
       throw new ApiError(404, 'Transaction not found.');
     }
@@ -151,27 +156,22 @@ router.patch(
     const input = parseBody(transactionSchema, merged);
     ensureNotFuture(input.date);
 
-    db.prepare(
-      `UPDATE transactions SET
-         type = ?, amount_paise = ?, category = ?, date = ?,
-         payment_method = ?, note = ?, updated_at = ?
-       WHERE id = ? AND user_id = ?`,
-    ).run(
-      input.type,
-      input.amountPaise,
-      input.category,
-      input.date,
-      input.paymentMethod,
-      input.note || '',
-      nowIso(),
+    const updated = await Transaction.findByIdAndUpdate(
       req.params.id,
-      req.user.id,
+      {
+        type: input.type,
+        amount_paise: input.amountPaise,
+        category: input.category,
+        date: input.date,
+        payment_method: input.paymentMethod,
+        note: input.note || '',
+        updated_at: new Date(),
+      },
+      { new: true },
     );
 
     res.json({
-      transaction: mapTransaction(
-        db.prepare('SELECT * FROM transactions WHERE id = ?').get(req.params.id),
-      ),
+      transaction: mapTransaction(updated),
     });
   }),
 );
@@ -179,10 +179,11 @@ router.patch(
 router.delete(
   '/:id',
   asyncHandler(async (req, res) => {
-    const result = db
-      .prepare('DELETE FROM transactions WHERE id = ? AND user_id = ?')
-      .run(req.params.id, req.user.id);
-    if (!result.changes) {
+    const result = await Transaction.deleteOne({
+      _id: req.params.id,
+      user_id: req.user.id,
+    });
+    if (result.deletedCount === 0) {
       throw new ApiError(404, 'Transaction not found.');
     }
     res.json({ ok: true });

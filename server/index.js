@@ -14,6 +14,7 @@ import recurringRoutes from './routes/recurring.js';
 import goalRoutes from './routes/goals.js';
 import reportRoutes from './routes/reports.js';
 import pushRoutes from './routes/push.js';
+import { connectDB } from './db.js';
 import { ApiError } from './lib/http.js';
 import { startReminderScheduler } from './lib/push.js';
 import { seedDemo } from './seed.js';
@@ -111,6 +112,8 @@ async function start() {
   if (isProduction && !process.env.JWT_SECRET) {
     console.warn('WARNING: JWT_SECRET is not set. Set a long random secret before deploying.');
   }
+
+  await connectDB();
 
   try {
     const seeded = await seedDemo();

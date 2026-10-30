@@ -1,6 +1,12 @@
 import crypto from 'node:crypto';
 import bcrypt from 'bcryptjs';
-import { db, nowIso } from './db.js';
+import { connectDB } from './db.js';
+import User from './models/User.js';
+import Transaction from './models/Transaction.js';
+import Budget from './models/Budget.js';
+import Recurring from './models/Recurring.js';
+import Goal from './models/Goal.js';
+import Contribution from './models/Contribution.js';
 import { addDays, addMonths, daysInMonth, toDateKey, toMonthKey } from './lib/date.js';
 
 const DEMO_EMAIL = 'demo@smartspend.in';
@@ -83,30 +89,26 @@ function dateFor(month, day) {
   return `${month}-${String(Math.min(Math.max(1, day), maxDay)).padStart(2, '0')}`;
 }
 
-function insertTransaction(userId, { type, category, rupees, day, method, note, month }) {
+async function insertTransaction(userId, { type, category, rupees, day, method, note, month }) {
   if (!rupees || rupees <= 0) return;
   const date = dateFor(month, day);
-  const timestamp = `${date}T10:00:00.000Z`;
-  db.prepare(
-    `INSERT INTO transactions
-      (id, user_id, type, amount_paise, category, date, payment_method, note, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    crypto.randomUUID(),
-    userId,
+  const timestamp = new Date(`${date}T10:00:00.000Z`);
+  await Transaction.create({
+    _id: crypto.randomUUID(),
+    user_id: userId,
     type,
-    Math.round(rupees * 100),
+    amount_paise: Math.round(rupees * 100),
     category,
     date,
-    method,
+    payment_method: method,
     note,
-    timestamp,
-    timestamp,
-  );
+    created_at: timestamp,
+    updated_at: timestamp,
+  });
 }
 
-function seedCurrentMonth(userId, month, todayDay) {
-  insertTransaction(userId, {
+async function seedCurrentMonth(userId, month, todayDay) {
+  await insertTransaction(userId, {
     type: 'income',
     category: 'allowance',
     rupees: 18000,
@@ -115,7 +117,7 @@ function seedCurrentMonth(userId, month, todayDay) {
     note: 'Monthly pocket money',
     month,
   });
-  insertTransaction(userId, {
+  await insertTransaction(userId, {
     type: 'income',
     category: 'freelance',
     rupees: 6000,
@@ -127,7 +129,7 @@ function seedCurrentMonth(userId, month, todayDay) {
 
   for (const [day, category, rupees, method, note] of CURRENT_EXPENSES) {
     const scaledDay = Math.max(1, Math.ceil((day / 31) * todayDay));
-    insertTransaction(userId, {
+    await insertTransaction(userId, {
       type: 'expense',
       category,
       rupees,
@@ -139,8 +141,8 @@ function seedCurrentMonth(userId, month, todayDay) {
   }
 }
 
-function seedPastMonth(userId, month, template, variation) {
-  insertTransaction(userId, {
+async function seedPastMonth(userId, month, template, variation) {
+  await insertTransaction(userId, {
     type: 'income',
     category: 'allowance',
     rupees: 18000,
@@ -149,7 +151,7 @@ function seedPastMonth(userId, month, template, variation) {
     note: 'Monthly pocket money',
     month,
   });
-  insertTransaction(userId, {
+  await insertTransaction(userId, {
     type: 'income',
     category: 'freelance',
     rupees: variation === 2 ? 4000 : 5500,
@@ -160,7 +162,7 @@ function seedPastMonth(userId, month, template, variation) {
   });
 
   for (const [day, category, rupees, method, note] of template) {
-    insertTransaction(userId, {
+    await insertTransaction(userId, {
       type: 'expense',
       category,
       rupees: variation === 2 ? Math.round(rupees * 0.94) : rupees,
@@ -172,7 +174,7 @@ function seedPastMonth(userId, month, template, variation) {
   }
 }
 
-function seedBudgets(userId, month) {
+async function seedBudgets(userId, month) {
   const limits = {
     overall: 18000,
     food: 4000,
@@ -186,24 +188,21 @@ function seedBudgets(userId, month) {
     health: 1000,
     education: 1500,
   };
-  const timestamp = nowIso();
+  const timestamp = new Date();
   for (const [category, rupees] of Object.entries(limits)) {
-    db.prepare(
-      `INSERT INTO budgets (id, user_id, month, category, limit_paise, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    ).run(
-      crypto.randomUUID(),
-      userId,
+    await Budget.create({
+      _id: crypto.randomUUID(),
+      user_id: userId,
       month,
       category,
-      Math.round(rupees * 100),
-      timestamp,
-      timestamp,
-    );
+      limit_paise: Math.round(rupees * 100),
+      created_at: timestamp,
+      updated_at: timestamp,
+    });
   }
 }
 
-function seedRecurring(userId, today) {
+async function seedRecurring(userId, today) {
   const bills = [
     {
       title: 'Electricity bill',
@@ -238,29 +237,26 @@ function seedRecurring(userId, today) {
       notes: 'Due on the 2nd',
     },
   ];
-  const timestamp = nowIso();
+  const timestamp = new Date();
 
   for (const bill of bills) {
-    db.prepare(
-      `INSERT INTO recurring_expenses
-        (id, user_id, title, amount_paise, category, frequency, next_due_date, notes, is_active, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
-    ).run(
-      crypto.randomUUID(),
-      userId,
-      bill.title,
-      Math.round(bill.amount * 100),
-      bill.category,
-      bill.frequency,
-      bill.nextDueDate,
-      bill.notes,
-      timestamp,
-      timestamp,
-    );
+    await Recurring.create({
+      _id: crypto.randomUUID(),
+      user_id: userId,
+      title: bill.title,
+      amount_paise: Math.round(bill.amount * 100),
+      category: bill.category,
+      frequency: bill.frequency,
+      next_due_date: bill.nextDueDate,
+      notes: bill.notes,
+      is_active: true,
+      created_at: timestamp,
+      updated_at: timestamp,
+    });
   }
 }
 
-function seedGoals(userId, today) {
+async function seedGoals(userId, today) {
   const goals = [
     {
       title: 'Emergency fund',
@@ -287,79 +283,91 @@ function seedGoals(userId, today) {
       color: '#E76F51',
     },
   ];
-  const timestamp = nowIso();
+  const timestamp = new Date();
 
   for (const goal of goals) {
     const goalId = crypto.randomUUID();
-    db.prepare(
-      `INSERT INTO savings_goals
-        (id, user_id, title, target_paise, saved_paise, monthly_target_paise, target_date, color, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(
-      goalId,
-      userId,
-      goal.title,
-      Math.round(goal.target * 100),
-      Math.round(goal.saved * 100),
-      Math.round((goal.monthly || 0) * 100),
-      goal.targetDate,
-      goal.color,
-      timestamp,
-      timestamp,
-    );
-    db.prepare(
-      `INSERT INTO savings_contributions
-        (id, goal_id, user_id, amount_paise, date, note, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    ).run(
-      crypto.randomUUID(),
-      goalId,
-      userId,
-      Math.round(goal.saved * 100),
-      addDays(today, -20),
-      'Opening balance',
-      timestamp,
-    );
+    const goalDoc = await Goal.create({
+      _id: goalId,
+      user_id: userId,
+      title: goal.title,
+      target_paise: Math.round(goal.target * 100),
+      saved_paise: Math.round(goal.saved * 100),
+      monthly_target_paise: Math.round((goal.monthly || 0) * 100),
+      target_date: goal.targetDate,
+      color: goal.color,
+      created_at: timestamp,
+      updated_at: timestamp,
+    });
+    await Contribution.create({
+      _id: crypto.randomUUID(),
+      goal_id: goalId,
+      user_id: userId,
+      amount_paise: Math.round(goal.saved * 100),
+      date: addDays(today, -20),
+      note: 'Opening balance',
+      created_at: timestamp,
+    });
   }
 }
 
 export async function seedDemo({ force = false } = {}) {
   if (process.env.SEED_DEMO === 'false') return { seeded: false, reason: 'disabled' };
 
-  const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(DEMO_EMAIL);
+  await connectDB();
+
+  const existing = await User.findOne({ email: DEMO_EMAIL });
   if (existing && !force) return { seeded: false, reason: 'exists' };
 
   if (existing && force) {
-    db.prepare('DELETE FROM users WHERE id = ?').run(existing.id);
+    await User.deleteOne({ _id: existing._id });
+    await Goal.deleteMany({ user_id: existing._id });
+    await Contribution.deleteMany({ user_id: existing._id });
+    await Transaction.deleteMany({ user_id: existing._id });
+    await Budget.deleteMany({ user_id: existing._id });
+    await Recurring.deleteMany({ user_id: existing._id });
+    await PushSubscription.deleteMany({ user_id: existing._id });
+    await NotificationLog.deleteMany({ user_id: existing._id });
   }
 
   const userId = crypto.randomUUID();
   const passwordHash = await bcrypt.hash(DEMO_PASSWORD, 12);
-  const timestamp = nowIso();
+  const timestamp = new Date();
   const today = toDateKey();
   const month = toMonthKey();
   const todayDay = Number(today.slice(8, 10));
 
-  db.transaction(() => {
-    db.prepare(
-      `INSERT INTO users
-        (id, name, email, password_hash, monthly_income_paise, currency, locale, theme, notifications, created_at)
-       VALUES (?, ?, ?, ?, ?, 'INR', 'en', 'light', 1, ?)`,
-    ).run(userId, 'Aarav Sharma', DEMO_EMAIL, passwordHash, 2_400_000, timestamp);
+  await User.create({
+    _id: userId,
+    name: 'Aarav Sharma',
+    email: DEMO_EMAIL,
+    password_hash: passwordHash,
+    monthly_income_paise: 2_400_000,
+    currency: 'INR',
+    locale: 'en',
+    theme: 'light',
+    notifications: true,
+  });
 
-    seedCurrentMonth(userId, month, todayDay);
-    seedPastMonth(userId, addMonths(month, -1), PREVIOUS_EXPENSES, 1);
-    seedPastMonth(userId, addMonths(month, -2), TWO_MONTHS_EXPENSES, 2);
-    seedBudgets(userId, month);
-    seedRecurring(userId, today);
-    seedGoals(userId, today);
-  })();
+  await seedCurrentMonth(userId, month, todayDay);
+  await seedPastMonth(userId, addMonths(month, -1), PREVIOUS_EXPENSES, 1);
+  await seedPastMonth(userId, addMonths(month, -2), TWO_MONTHS_EXPENSES, 2);
+  await seedBudgets(userId, month);
+  await seedRecurring(userId, today);
+  await seedGoals(userId, today);
 
   return { seeded: true, email: DEMO_EMAIL, password: DEMO_PASSWORD };
 }
 
 if (process.argv[1] && process.argv[1].endsWith('seed.js')) {
-  const result = await seedDemo({ force: process.argv.includes('--force') });
-  console.log(result);
-  db.close();
+  (async () => {
+    try {
+      const result = await seedDemo({ force: process.argv.includes('--force') });
+      console.log(result);
+    } catch (error) {
+      console.error(error);
+    } finally {
+      process.exit(0);
+    }
+  })();
 }
