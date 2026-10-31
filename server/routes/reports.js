@@ -57,10 +57,11 @@ router.get(
 
     const prevMonth = previousMonth(month);
     const prevInfo = monthBounds(prevMonth);
-    const previousTransactions = await Transaction.find({
+    const previousTransactionsDocs = await Transaction.find({
       user_id: req.user.id,
       date: { $gte: prevInfo.start, $lte: prevInfo.end },
-    }).map((t) => ({
+    });
+    const previousTransactions = previousTransactionsDocs.map((t) => ({
       id: t._id,
       type: t.type,
       amountPaise: t.amount_paise,
@@ -126,9 +127,13 @@ router.get(
     ];
 
     const filename = `smartspend-report-${month}.csv`;
+    const csvContent = `\uFEFF${csvRows(rows)}`;
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-    res.send(`\uFEFF${csvRows(rows)}`);
+    res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(filename)}"`);
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+    res.send(csvContent);
   }),
 );
 

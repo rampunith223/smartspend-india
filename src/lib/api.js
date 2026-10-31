@@ -39,18 +39,49 @@ export async function api(path, options = {}) {
 export const fetcher = (path) => api(path.startsWith('/api') ? path.slice(4) : path);
 
 export async function downloadFile(path, filename) {
-  const response = await fetch(`/api${path}`, { credentials: 'include' });
-  if (!response.ok) {
-    const data = await response.json().catch(() => null);
-    throw new ApiError(data?.message || 'Could not download the report.', response.status);
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 30000); // 30s timeout
+
+  try {
+    const response = await fetch(`/api${path}`, {
+      credentials: 'include',
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      // Try to read error body as text (could be JSON, HTML, or plain text)
+      let errorMessage = 'Could not download the report.';
+      try {
+        const text = await response.text();
+        errorMessage = text || errorMessage;
+        // Try to parse as JSON if possible
+        try {
+          const json = JSON.parse(text);
+          if (json?.message) errorMessage = json.message;
+        } catch {
+          // Not JSON, use raw text
+        }
+      } catch {
+        /* ignore */
+      }
+      throw new ApiError(errorMessage, response.status);
+    }
+
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = filename;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    URL.revokeObjectURL(url);
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      throw new ApiError('Download timed out. Please try again.', 408);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeoutId);
   }
-  const blob = await response.blob();
-  const url = URL.createObjectURL(blob);
-  const anchor = document.createElement('a');
-  anchor.href = url;
-  anchor.download = filename;
-  document.body.appendChild(anchor);
-  anchor.click();
-  anchor.remove();
-  URL.revokeObjectURL(url);
 }
